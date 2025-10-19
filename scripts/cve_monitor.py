@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import sys
-import time
 import json
 import smtplib
 from datetime import datetime, timedelta, timezone
@@ -11,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
-NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+CIRCL_LAST_URL = "https://cve.circl.lu/api/last/{count}"
 
 
 def log(msg: str) -> None:
@@ -56,116 +55,131 @@ def read_keywords(path: str) -> List[str]:
         return []
 
 
-def iso8601_utc_z(dt: datetime) -> str:
-    # NVD expects ISO 8601 in UTC with a trailing 'Z'. Include milliseconds.
-    dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S") + ".000Z"
+# -------------------- CIRCL helpers --------------------
+
+def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Parse datetime strings from CIRCL. Make timezone-aware in UTC when possible."""
+    if not value:
+        return None
+    try:
+        # Handle trailing Z
+        v = value
+        if v.endswith("Z"):
+            v = v[:-1] + "+00:00"
+        # If there's no timezone, assume UTC
+        dt = datetime.fromisoformat(v)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except Exception:
+        # Try common formats
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dt = datetime.strptime(value, fmt)
+                return dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+    return None
 
 
-def fetch_cves_for_keyword(keyword: str, start_iso: str, end_iso: str, api_key: Optional[str]) -> List[dict]:
-    """Fetch all CVEs for a given keyword and time window, handling pagination."""
-    headers = {}
-    if api_key:
-        # Support both common header names, though NVD uses 'apiKey'
-        headers["apiKey"] = api_key
-        headers["X-Api-Key"] = api_key
-
-    results: List[dict] = []
-    start_index = 0
-    page_size = 2000  # Max allowed by NVD; minimizes pagination
-
-    while True:
-        params = {
-            "keywordSearch": keyword,
-            "pubStartDate": start_iso,
-            "pubEndDate": end_iso,
-            "startIndex": start_index,
-            "resultsPerPage": page_size,
-            "noRejected": "true",
-        }
+def fetch_recent_circl_cves() -> List[dict]:
+    """Fetch the most recent CVEs from CIRCL, trying larger counts first and
+    gracefully degrading on errors or rate limits.
+    """
+    for count in (200, 100, 50):
+        url = CIRCL_LAST_URL.format(count=count)
         try:
-            resp = requests.get(NVD_API_URL, params=params, headers=headers, timeout=30)
+            resp = requests.get(url, timeout=30)
         except Exception as e:
-            log(f"Error querying NVD for '{keyword}': {e}")
-            break
+            log(f"Error querying CIRCL {url}: {e}")
+            continue
 
-        if resp.status_code != 200:
-            log(
-                f"NVD API returned status {resp.status_code} for '{keyword}'. "
-                f"Response: {resp.text[:300]}"
-            )
-            break
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                if isinstance(data, list):
+                    return data
+                # Some responses might wrap differently, attempt to normalize
+                if isinstance(data, dict) and "cves" in data and isinstance(data["cves"], list):
+                    return data["cves"]
+                # Fallback: unknown format
+                log("CIRCL response JSON format was not a list; proceeding with empty list.")
+                return []
+            except json.JSONDecodeError:
+                log("Failed to decode CIRCL response as JSON")
+                return []
+        else:
+            preview = resp.text[:300] if resp.text else ""
+            log(f"CIRCL API returned status {resp.status_code} for {url}. {preview}")
+            # Try next smaller count on 4xx/5xx
+            continue
 
-        try:
-            data = resp.json()
-        except json.JSONDecodeError:
-            log("Failed to decode NVD response as JSON")
-            break
-
-        vulnerabilities = data.get("vulnerabilities", [])
-        results.extend(vulnerabilities)
-
-        total = int(data.get("totalResults", len(results)))
-        rpp = int(data.get("resultsPerPage", page_size))
-        start_index += rpp
-
-        if start_index >= total or not vulnerabilities:
-            break
-
-        # Be nice to the API if no key is provided
-        if not api_key:
-            time.sleep(1.2)
-
-    return results
+    # If all attempts failed
+    return []
 
 
-def extract_cve_summary(item: dict) -> Optional[Dict[str, Optional[str]]]:
-    cve = item.get("cve", {})
-    cve_id = cve.get("id")
+def extract_circl_summary(item: dict) -> Optional[Dict[str, Optional[str]]]:
+    """Extract the fields we need from a CIRCL CVE item."""
+    cve_id = item.get("id") or item.get("cve")
     if not cve_id:
         return None
 
-    published = cve.get("published")
+    published_raw = item.get("Published") or item.get("published")
+    published_dt = _parse_datetime(published_raw)
+    published_str = None
+    if published_dt:
+        published_str = published_dt.astimezone(timezone.utc).isoformat()
 
-    # Description (prefer English)
-    description = None
-    for desc in cve.get("descriptions", []) or []:
-        if desc.get("lang") == "en" and desc.get("value"):
-            description = desc.get("value")
-            break
-    if not description and cve.get("descriptions"):
-        description = (cve.get("descriptions")[0] or {}).get("value")
+    summary = item.get("summary") or item.get("description") or ""
 
-    # Metrics: prefer CVSS v3.1, then v3.0, then v2
-    score: Optional[float] = None
-    severity: Optional[str] = None
-    metrics = cve.get("metrics", {}) or {}
-    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
-        arr = metrics.get(key) or []
-        if arr:
-            entry = arr[0]
-            cvss = entry.get("cvssData") or {}
-            score = cvss.get("baseScore")
-            severity = entry.get("baseSeverity") or entry.get("severity")
-            break
-
-    # First reference URL if available
+    # References can be a list of URLs
+    references = item.get("references") or []
     ref_url = None
-    for ref in cve.get("references", []) or []:
-        url = ref.get("url")
-        if url:
-            ref_url = url
-            break
+    if isinstance(references, list) and references:
+        ref_url = str(references[0])
+    elif isinstance(references, str):
+        ref_url = references
+
+    # Scores
+    cvss3 = item.get("cvss3")
+    cvss2 = item.get("cvss")
+
+    score_val = None
+    sev_label = None
+    # Prefer cvss3 if present
+    if cvss3 is not None:
+        try:
+            score_val = float(cvss3)
+        except (TypeError, ValueError):
+            # sometimes provided as string with vector; best effort to extract number at start
+            try:
+                score_val = float(str(cvss3).split()[0])
+            except Exception:
+                score_val = None
+        sev_label = f"CVSS3 {score_val}" if score_val is not None else "CVSS3"
+    elif cvss2 is not None:
+        try:
+            score_val = float(cvss2)
+        except (TypeError, ValueError):
+            try:
+                score_val = float(str(cvss2).split()[0])
+            except Exception:
+                score_val = None
+        sev_label = f"CVSS {score_val}" if score_val is not None else "CVSS"
 
     return {
         "id": cve_id,
-        "published": published,
-        "score": f"{score}" if score is not None else None,
-        "severity": severity,
-        "description": description,
+        "published": published_str or (published_raw or None),
+        "score": f"{score_val}" if score_val is not None else None,
+        "severity": sev_label,
+        "description": summary,
         "url": ref_url,
     }
 
+
+# -------------------- Email --------------------
 
 def send_email(subject: str, body: str) -> bool:
     host = os.getenv("EMAIL_HOST")
@@ -217,12 +231,23 @@ def send_email(subject: str, body: str) -> bool:
         return False
 
 
+# -------------------- Formatting --------------------
+
+def _safe_parse_any_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return _parse_datetime(s)
+    except Exception:
+        return None
+
+
 def build_email_content(keywords: List[str], start: datetime, end: datetime, cves: List[Dict[str, Optional[str]]]) -> Tuple[str, str]:
     end_s = end.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     start_s = start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     subject = f"CVE Monitor: {len(cves)} match(es) between {start_s} and {end_s}"
 
-    lines = []
+    lines: List[str] = []
     lines.append("CVE Monitor Summary")
     lines.append("")
     lines.append(f"Window: {start_s} -> {end_s}")
@@ -234,15 +259,8 @@ def build_email_content(keywords: List[str], start: datetime, end: datetime, cve
     # Sort by published date descending when available
     def sort_key(x):
         pub = x.get("published")
-        try:
-            # NVD format is ISO w/o timezone suffix sometimes; handle both
-            if pub and pub.endswith("Z"):
-                return datetime.strptime(pub, "%Y-%m-%dT%H:%M:%S.%fZ")
-            elif pub:
-                return datetime.strptime(pub, "%Y-%m-%dT%H:%M:%S.%f")
-        except Exception:
-            pass
-        return datetime.min
+        dt = _safe_parse_any_iso(pub)
+        return dt or datetime.min.replace(tzinfo=timezone.utc)
 
     for cve in sorted(cves, key=sort_key, reverse=True):
         cid = cve.get("id") or "(unknown)"
@@ -265,47 +283,66 @@ def build_email_content(keywords: List[str], start: datetime, end: datetime, cve
     return subject, body
 
 
+# -------------------- Main --------------------
+
 def main() -> int:
     targets_file = find_targets_file()
     keywords = read_keywords(targets_file)
     log(f"Loaded {len(keywords)} keyword(s) from {targets_file}")
 
-    # Compute 1-hour UTC window
+    # Compute 10-minute UTC window to tolerate scheduler drift
     end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(hours=1)
-    start_iso = iso8601_utc_z(start_dt)
-    end_iso = iso8601_utc_z(end_dt)
-
-    api_key = os.getenv("NVD_API_KEY")
-
-    cve_map: Dict[str, Dict[str, Optional[str]]] = {}
-    total_api_items = 0
+    start_dt = end_dt - timedelta(minutes=10)
 
     if not keywords:
-        log("No keywords specified. Exiting without querying NVD.")
-    else:
-        for kw in keywords:
-            log(f"Querying NVD for keyword '{kw}' within last hour...")
-            items = fetch_cves_for_keyword(kw, start_iso, end_iso, api_key)
-            total_api_items += len(items)
-            for item in items:
-                summary = extract_cve_summary(item)
-                if not summary:
-                    continue
-                cve_id = summary["id"]
-                if cve_id not in cve_map:
-                    cve_map[cve_id] = summary
+        log("No keywords specified. Exiting without querying CIRCL.")
+        return 0
 
-    cves = list(cve_map.values())
-    log(f"NVD results: {total_api_items} item(s) returned across keywords; {len(cves)} unique CVE(s) after de-dup.")
+    # Fetch recent CVEs from CIRCL
+    log("Fetching recent CVEs from CIRCL (prioritizing freshness)...")
+    items = fetch_recent_circl_cves()
+    log(f"CIRCL returned {len(items)} CVE item(s)")
 
-    if cves:
-        subject, body = build_email_content(keywords, start_dt, end_dt, cves)
+    # Filter: published within window and keyword match (id or summary)
+    matches_map: Dict[str, Dict[str, Optional[str]]] = {}
+    for item in items:
+        try:
+            published_raw = item.get("Published") or item.get("published")
+            published_dt = _parse_datetime(published_raw)
+            if not published_dt:
+                continue
+            if not (start_dt <= published_dt <= end_dt):
+                continue
+
+            cve_id = item.get("id") or item.get("cve") or ""
+            summary = (item.get("summary") or item.get("description") or "").lower()
+            id_lower = str(cve_id).lower()
+
+            if not any(kw.lower() in id_lower or kw.lower() in summary for kw in keywords):
+                continue
+
+            summary_obj = extract_circl_summary(item)
+            if not summary_obj:
+                continue
+
+            cid = summary_obj["id"]
+            if cid not in matches_map:
+                matches_map[cid] = summary_obj
+        except Exception as e:
+            # Robust handling: skip malformed entries
+            log(f"Skipping malformed CVE item due to error: {e}")
+            continue
+
+    matches = list(matches_map.values())
+    log(f"Filtered to {len(matches)} matching CVE(s) within the last 10 minutes")
+
+    if matches:
+        subject, body = build_email_content(keywords, start_dt, end_dt, matches)
         send_email(subject, body)
     else:
-        log("No CVEs found in the last hour for the given keywords. No email will be sent.")
+        log("No CVEs matched the keywords in the 10-minute window. No email will be sent.")
 
-    # Always exit 0 to avoid failing the workflow
+    # Always exit 0 to avoid failing the workflow on transient issues
     return 0
 
 
