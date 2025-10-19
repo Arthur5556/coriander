@@ -181,6 +181,22 @@ def extract_circl_summary(item: dict) -> Optional[Dict[str, Optional[str]]]:
 
 # -------------------- Email --------------------
 
+def email_config_complete() -> bool:
+    required_vars = [
+        "EMAIL_HOST",
+        "EMAIL_PORT",
+        "EMAIL_USER",
+        "EMAIL_PASS",
+        "EMAIL_FROM",
+        "EMAIL_TO",
+    ]
+    missing = [name for name in required_vars if not os.getenv(name)]
+    if missing:
+        log(f"Email not fully configured; missing: {', '.join(missing)}")
+        return False
+    return True
+
+
 def send_email(subject: str, body: str) -> bool:
     host = os.getenv("EMAIL_HOST")
     port = os.getenv("EMAIL_PORT")
@@ -283,6 +299,44 @@ def build_email_content(keywords: List[str], start: datetime, end: datetime, cve
     return subject, body
 
 
+# -------------------- File output fallback --------------------
+
+def get_repo_root() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(script_dir, os.pardir))
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def write_reports(raw_items: List[dict], summaries: List[Dict[str, Optional[str]]], keywords: List[str], start: datetime, end: datetime) -> None:
+    try:
+        repo_root = get_repo_root()
+        reports_dir = os.path.join(repo_root, "cve_reports")
+        ensure_dir(reports_dir)
+
+        ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+        latest_json_path = os.path.join(reports_dir, "latest.json")
+        ts_matches_path = os.path.join(reports_dir, f"{ts_str}_matches.json")
+        latest_md_path = os.path.join(reports_dir, "latest.md")
+
+        with open(latest_json_path, "w", encoding="utf-8") as f:
+            json.dump(raw_items, f, indent=2, sort_keys=True, ensure_ascii=False)
+
+        with open(ts_matches_path, "w", encoding="utf-8") as f:
+            json.dump(summaries, f, indent=2, sort_keys=True, ensure_ascii=False)
+
+        subject, body = build_email_content(keywords, start, end, summaries)
+        md_content = f"# {subject}\n\n" + body + "\n"
+        with open(latest_md_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+
+        log(f"Wrote reports to {reports_dir}: latest.json, {os.path.basename(ts_matches_path)}, latest.md")
+    except Exception as e:
+        log(f"Failed to write CVE reports to files: {e}")
+
+
 # -------------------- Main --------------------
 
 def main() -> int:
@@ -304,7 +358,8 @@ def main() -> int:
     log(f"CIRCL returned {len(items)} CVE item(s)")
 
     # Filter: published within window and keyword match (id or summary)
-    matches_map: Dict[str, Dict[str, Optional[str]]] = {}
+    summary_map: Dict[str, Dict[str, Optional[str]]] = {}
+    raw_map: Dict[str, dict] = {}
     for item in items:
         try:
             published_raw = item.get("Published") or item.get("published")
@@ -326,19 +381,28 @@ def main() -> int:
                 continue
 
             cid = summary_obj["id"]
-            if cid not in matches_map:
-                matches_map[cid] = summary_obj
+            if cid not in summary_map:
+                summary_map[cid] = summary_obj
+                raw_map[cid] = item
         except Exception as e:
             # Robust handling: skip malformed entries
             log(f"Skipping malformed CVE item due to error: {e}")
             continue
 
-    matches = list(matches_map.values())
-    log(f"Filtered to {len(matches)} matching CVE(s) within the last 10 minutes")
+    matches_summaries = list(summary_map.values())
+    matches_raw = list(raw_map.values())
+    log(f"Filtered to {len(matches_summaries)} matching CVE(s) within the last 10 minutes")
 
-    if matches:
-        subject, body = build_email_content(keywords, start_dt, end_dt, matches)
-        send_email(subject, body)
+    if matches_summaries:
+        if email_config_complete():
+            subject, body = build_email_content(keywords, start_dt, end_dt, matches_summaries)
+            sent = send_email(subject, body)
+            if not sent:
+                log("Email send failed. Writing reports to repository as fallback.")
+                write_reports(matches_raw, matches_summaries, keywords, start_dt, end_dt)
+        else:
+            log("Email not configured. Writing reports to repository.")
+            write_reports(matches_raw, matches_summaries, keywords, start_dt, end_dt)
     else:
         log("No CVEs matched the keywords in the 10-minute window. No email will be sent.")
 
